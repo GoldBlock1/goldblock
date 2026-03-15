@@ -1,0 +1,142 @@
+name: GoldBlock — Analyse hebdomadaire
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'  # Lundi 7h UTC = 8h Paris
+  workflow_dispatch:       # Déclenchement manuel possible
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Générer les analyses XAUUSD & BTCUSD
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          node << 'SCRIPT'
+          const https = require('https');
+
+          const SB_URL     = process.env.SUPABASE_URL;
+          const SB_SERVICE = process.env.SUPABASE_SERVICE_KEY;
+          const CLAUDE_KEY = process.env.ANTHROPIC_API_KEY;
+
+          function request(options, body) {
+            return new Promise((resolve, reject) => {
+              const req = https.request(options, res => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try { resolve(JSON.parse(data)); }
+                  catch { resolve(data); }
+                });
+              });
+              req.on('error', reject);
+              if (body) req.write(body);
+              req.end();
+            });
+          }
+
+          async function generateAnalysis(actif) {
+            const today = new Date().toLocaleDateString('fr-FR', {
+              weekday:'long', day:'numeric', month:'long', year:'numeric',
+              timeZone:'Europe/Paris'
+            });
+
+            const prompt = `Tu es un analyste de marché professionnel. Aujourd'hui c'est ${today}.
+Génère une analyse complète de marché pour ${actif} basée sur les données actuelles.
+
+Retourne UNIQUEMENT ce JSON valide (sans markdown, sans backticks) :
+{
+  "actif": "${actif}",
+  "titre": "Titre accrocheur de l'analyse en français",
+  "sous_titre": "Résumé 1 ligne avec prix actuel et contexte",
+  "score": <1 à 5 selon la qualité du setup>,
+  "semaine": "Semaine du ${today}",
+  "contenu": "<HTML de l'analyse avec : <h2>1. Contexte Géopolitique & Macro</h2> tableau HTML des indicateurs (DXY, taux réels, VIX, Fed Rate, CPI, S&P500), <h2>2. Analyse Fondamentale</h2> calendrier économique de la semaine avec vrais événements, <h2>3. Analyse Technique</h2> niveaux supports/résistances actuels réels, SMC, Fibonacci, <h2>4. Notation du Setup</h2> grille 5 étoiles avec justification, <h2>5. Setup de Trade</h2> PE/SL/TP1/TP2/TP3 avec prix exacts si score >= 3 sinon AUCUNE OPPORTUNITÉ, <h2>6. À Surveiller cette Semaine</h2> événements clés>"
+}
+
+Règles : prix réels et actuels, tableaux HTML pour données macro, niveaux exacts.`;
+
+            const body = JSON.stringify({
+              model: 'claude-opus-4-6',
+              max_tokens: 8000,
+              system: 'Tu es un analyste de marché professionnel. Réponds uniquement en JSON valide sans markdown.',
+              tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+              messages: [{ role: 'user', content: prompt }]
+            });
+
+            const options = {
+              hostname: 'api.anthropic.com',
+              path: '/v1/messages',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': CLAUDE_KEY,
+                'anthropic-version': '2023-06-01',
+                'Content-Length': Buffer.byteLength(body)
+              }
+            };
+
+            console.log(`[GoldBlock] Génération ${actif}...`);
+            const data = await request(options, body);
+
+            const textBlock = data.content?.find(b => b.type === 'text');
+            if (!textBlock) throw new Error(`Pas de texte dans la réponse pour ${actif}`);
+
+            let text = textBlock.text.trim()
+              .replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+            
+            return JSON.parse(text);
+          }
+
+          async function storeInSupabase(analysis) {
+            const body = JSON.stringify({
+              actif:        analysis.actif,
+              titre:        analysis.titre,
+              sous_titre:   analysis.sous_titre,
+              score:        analysis.score,
+              contenu:      analysis.contenu,
+              semaine:      analysis.semaine,
+              published_at: new Date().toISOString(),
+              visible:      true
+            });
+
+            const url = new URL(`${SB_URL}/rest/v1/newsletters`);
+            const options = {
+              hostname: url.hostname,
+              path: url.pathname,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'apikey': SB_SERVICE,
+                'Authorization': `Bearer ${SB_SERVICE}`,
+                'Prefer': 'return=minimal',
+                'Content-Length': Buffer.byteLength(body)
+              }
+            };
+
+            const res = await request(options, body);
+            console.log(`[GoldBlock] ${analysis.actif} stocké ✅ (score: ${analysis.score}/5)`);
+            return res;
+          }
+
+          async function main() {
+            const actifs = ['XAUUSD', 'BTCUSD'];
+            for (const actif of actifs) {
+              try {
+                const analysis = await generateAnalysis(actif);
+                await storeInSupabase(analysis);
+                // Pause entre les deux analyses
+                await new Promise(r => setTimeout(r, 5000));
+              } catch(err) {
+                console.error(`[GoldBlock] Erreur ${actif}:`, err.message);
+                process.exit(1);
+              }
+            }
+            console.log('[GoldBlock] ✅ 2 analyses générées et publiées !');
+          }
+
+          main();
+          SCRIPT
